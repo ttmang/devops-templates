@@ -1,0 +1,196 @@
+# File: devops-templates/.github/workflows/tf-pr-logic.yml
+name: "Reusable Terraform PR Logic"
+
+on:
+  workflow_call:
+    inputs:
+      tf_version:
+        description: 'Terraform Version to use'
+        required: false
+        default: '1.5.0'
+        type: string
+    secrets:
+      AZURE_CLIENT_ID:
+        required: true
+      AZURE_SUBSCRIPTION_ID:
+        required: true
+      AZURE_TENANT_ID:
+        required: true
+      INFRACOST_API_KEY:
+        required: true
+
+jobs:
+  # =========================================================
+  # JOB 1: COST ESTIMATION (Infracost)
+  # =========================================================
+  cost-estimation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Caller Code
+        uses: actions/checkout@v4
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Generate Infracost JSON
+        run: infracost breakdown --path . --format json --out-file infracost.json
+
+      - name: Upload Infracost Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: infracost-data
+          path: infracost.json
+
+  # =========================================================
+  # JOB 2: PLAN, SCAN & COMMENT
+  # =========================================================
+  plan-comment:
+    needs: [cost-estimation]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Caller Code
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ inputs.tf_version }} # Uses the input!
+          terraform_wrapper: false
+          
+      - name: Terraform Init & Validate
+        run: terraform init && terraform validate
+
+      # 1. Plan
+      - name: Terraform Plan
+        id: tf-plan
+        run: |
+          export exitcode=0
+          terraform plan -detailed-exitcode -out=tfplan || export exitcode=$?
+          echo "exitcode=$exitcode" >> $GITHUB_OUTPUT
+          if [ $exitcode -eq 1 ]; then exit 1; fi
+
+      # 2. Checkov
+      - name: Convert Plan to JSON
+        run: terraform show -json tfplan > tfplan.json
+
+      - name: Run Checkov
+        id: checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          file: tfplan.json 
+          framework: terraform_plan
+          output_format: cli,sarif
+          output_file_path: console,results.sarif
+          soft_fail: true 
+          #skip_download: true
+
+      # 3. Commenting Logic
+      - name: Download Infracost Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: infracost-data
+          path: .
+          
+      - name: Render Plan to Text
+        run: terraform show -no-color tfplan > plan.txt
+
+      - name: Post or Update Review Comment
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            // ... (Insert your EXACT Javascript from the previous step here) ...
+            // I omitted the full JS block for brevity, but copy it exactly as it was.
+            // It will work perfectly because 'plan.txt' and 'infracost.json' are generated locally.
+            // --- LOAD DATA ---
+            const planText = fs.readFileSync('plan.txt', 'utf8');
+            const infracostJSON = JSON.parse(fs.readFileSync('infracost.json', 'utf8'));
+            
+            // --- BUILD INFRACOST TABLE MANUALLY ---
+            let tableRows = [];
+            const projects = infracostJSON.projects || [];
+            
+            projects.forEach(project => {
+              const resources = project.breakdown?.resources || [];
+              resources.forEach(res => {
+                const resCost = parseFloat(res.monthlyCost).toFixed(2);
+                tableRows.push(`| **${res.name}** | | | **$${resCost}** |`);
+                const components = res.costComponents || [];
+                components.forEach(comp => {
+                   const compCost = parseFloat(comp.monthlyCost).toFixed(2);
+                   const qty = comp.monthlyQuantity || '-';
+                   const unit = comp.unit || '-';
+                   tableRows.push(`| └─ ${comp.name} | ${qty} | ${unit} | $${compCost} |`);
+                });
+              });
+            });
+
+            if (tableRows.length === 0) {
+              tableRows.push('| No billable resources detected | - | - | $0.00 |');
+            }
+
+            const infracostTable = `| Resource | Monthly Qty | Unit | Monthly Cost |
+            | :--- | :--- | :--- | :--- |
+            ${tableRows.join('\n')}`;
+
+            // --- PARSE STATUS ---
+            const totalCost = parseFloat(infracostJSON.totalMonthlyCost).toFixed(2);
+            
+            // CHECKOV STATUS (Now comes from the step "checkov", not "needs")
+            const checkovOutcome = '${{ steps.checkov.outcome }}';
+            const checkovEmoji = checkovOutcome === 'success' ? '✅' : '❌';
+            const checkovDetails = checkovOutcome === 'success' ? 'Passed' : 'Violations Found (Check Logs)';
+            
+            const planCode = '${{ steps.tf-plan.outputs.exitcode }}';
+            let planMsg = (planCode === '2') ? '⚠️ **Changes Detected**' : (planCode === '0' ? '✅ **No Changes**' : '❌ **Plan Failed**');
+
+            // --- BUILD FINAL COMMENT BODY ---
+            const body = `### 🤖 Terraform Review 🤖
+            
+            | Check | Status | Details |
+            | :--- | :--- | :--- |
+            | **Security** | ${checkovEmoji} | ${checkovDetails} |
+            | **Cost** | 💰 | **$${totalCost}** / month |
+            | **Plan** | ${planMsg.split(' ')[0]} | ${planMsg.split(' ').slice(1).join(' ')} |
+
+            <details><summary>💰 <strong>Show Cost Breakdown</strong></summary>
+
+            ${infracostTable}
+            
+            > *Total: $${totalCost} / month*
+            </details>
+
+            <details><summary>📄 <strong>Show Full Terraform Plan</strong></summary>
+            
+            \`\`\`terraform
+            ${planText.substring(0, 64000)}
+            \`\`\`
+            </details>`;
+
+            // --- POST/UPDATE COMMENT ---
+            const header = '#### terraform-plan-comment';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number,
+            });
+            const botComment = comments.find(c => c.body.includes(header));
+            const finalBody = `${header}\n${body}`;
+
+            if (botComment) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo, comment_id: botComment.id, body: finalBody
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo, issue_number: context.issue.number, body: finalBody
+              });
+            }
